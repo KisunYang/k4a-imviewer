@@ -2,6 +2,8 @@
 
 Azure Kinect DK용 뷰어: 컬러·깊이·(선택) RVM 바닥/그림자/반사 합성.
 
+![샘플 화면: 설정 패널, Dreams(크로마키), Depth, Color 뷰](docs/sample_screen.png)
+
 ## 요구 사항
 
 - Windows, [Azure Kinect Sensor SDK](https://github.com/microsoft/Azure-Kinect-Sensor-SDK)

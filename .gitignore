@@ -42,3 +42,6 @@ models/*.onnx.data
 # 에디터
 .cursor/
 .idea/
+
+# 실수로 상위 폴더 안에 클론된 중첩 저장소(삭제해도 됨)
+k4a-imviewer/

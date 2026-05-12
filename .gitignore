@@ -1,0 +1,44 @@
+# CMake / MSVC
+build/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+!CMakeLists.txt
+*.vcxproj*
+*.sln
+.vs/
+x64/
+*.user
+*.opendb
+*.opensdf
+*.sdf
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ONNX Runtime (CMake 첫 구성 시 자동 다운로드)
+third_party/onnxruntime-*/
+
+# 로컬 바이너리·설치기 (저장소에 포함하지 않음)
+*.exe
+opencv-*.exe
+
+# OpenCV 소스/빌드 트리(용량 큼) — 로컬에서 OpenCV_DIR 로 지정
+opencv/
+
+# ImGui 로컬 설정
+imgui.ini
+
+# RVM 가중치(원하면 Git LFS 또는 Release 자산으로 별도 배포)
+models/*.onnx
+models/*.pth
+models/*.onnx.data
+
+# 에디터
+.cursor/
+.idea/

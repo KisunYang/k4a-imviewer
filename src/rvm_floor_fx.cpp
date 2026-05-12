@@ -19,6 +19,12 @@
 #include <windows.h>
 #endif
 
+/**
+ * Azure Kinect 정렬 컬러/깊이 + RVM(또는 깊이 보조) 알파를 이용한 바닥 합성.
+ * - 바닥 평면 RANSAC, 바닥 마스크
+ * - 접촉 그림자(가우시안), 2D 거울 반사, 3D 캐스트 그림자(평행광)
+ * - ONNX Runtime 또는 OpenCV DNN으로 RVM 추론(선택)
+ */
 namespace rvm_floor {
 
 namespace {
@@ -96,21 +102,22 @@ void ensure_same_size(const cv::Mat& a, cv::Mat& b, int interpolation = cv::INTE
     b = r;
 }
 
+/** 이미지 좌표 기반 근사 바닥: 깊이 z(mm) ≈ a*x + b*y + c (intrinsics 없을 때 보조) */
 struct PlaneZ
 {
-    // z = ax + by + c
     float a = 0.f, b = 0.f, c = 0.f;
     bool valid = false;
 };
 
+/** 카메라 좌표(미터) 평면 n·p + d = 0, 법선 n 단위벡터 */
 struct Plane3
 {
-    // n·p + d = 0  (camera space, meters)
     cv::Vec3f n{0.f, 0.f, 0.f};
     float d = 0.f;
     bool valid = false;
 };
 
+/** 픽셀(u,v) + 깊이(mm) → 카메라 공간 3D점(미터) */
 static inline bool backproject_m(int u, int v, uint16_t z_mm, const Params& p, cv::Vec3f& out)
 {
     if (!p.cam_intrin_valid || z_mm < 250 || z_mm > 8000)
@@ -131,7 +138,7 @@ static inline bool fit_plane3_cam(const cv::Vec3f& p1, const cv::Vec3f& p2, cons
     if (nn < 1e-6f)
         return false;
     n *= (1.0f / nn);
-    // floor normal should have strong Y component (camera Y points down)
+    /* 바닥 법선은 카메라 Y(화면 아래) 성분이 커야 함 — Y가 약하면 바닥이 아닌 벽/잡음일 가능성 */
     if (std::abs(n[1]) < 0.55f)
         return false;
     const float d = -(n[0] * p1[0] + n[1] * p1[1] + n[2] * p1[2]);
@@ -149,12 +156,18 @@ static cv::Vec3f normalized_safe(const cv::Vec3f& v)
     return v * (1.0f / n);
 }
 
+/**
+ * 깊이+알파로 바닥 평면 추정(카메라 3D).
+ * 하단에서 사람 알파로 발 위치 추정 → 발 주변 ROI의 바닥 깊이만 샘플 → RANSAC.
+ * plane_temporal_smooth_on 이면 프레임 간 EMA로 흔들림 완화.
+ */
 static Plane3 estimate_floor_plane_ransac_cam(const cv::Mat& d, const cv::Mat& a, const Params& p)
 {
     if (!p.cam_intrin_valid)
         return {};
     const int H = d.rows;
     const int W = d.cols;
+    /* 발 쪽 x 중심: 화면 아래쪽부터 스캔해 알파가 큰 열의 평균 */
     float foot_x = 0.5f * static_cast<float>(W);
     bool foot_found = false;
     {
@@ -205,6 +218,7 @@ static Plane3 estimate_floor_plane_ransac_cam(const cv::Mat& d, const cv::Mat& a
                 pts.push_back(pt);
         }
     }
+    /* 발 ROI만 쓰면 점이 너무 적을 때: ROI 제한 없이 바닥 후보 다시 모음 */
     if (pts.size() < 24 && p.plane_use_foot_roi)
     {
         pts.clear();
@@ -229,6 +243,7 @@ static Plane3 estimate_floor_plane_ransac_cam(const cv::Mat& d, const cv::Mat& a
     cv::RNG rng(0x2442);
     Plane3 best{};
     int best_inliers = 0;
+    /* 3점으로 평면 후보 → inlier 수가 최대인 평면 선택 */
     for (int it = 0; it < 140; ++it)
     {
         const int i1 = rng.uniform(0, static_cast<int>(pts.size()));
@@ -258,6 +273,7 @@ static Plane3 estimate_floor_plane_ransac_cam(const cv::Mat& d, const cv::Mat& a
     if (!p.plane_temporal_smooth_on)
         return best;
     const float alpha = std::clamp(p.plane_temporal_alpha, 0.02f, 1.0f);
+    /* 동일 카메라 해상도일 때만 이전 프레임 평면과 (n,d) 선형 보간 */
     struct PlaneHist
     {
         bool valid = false;
@@ -292,6 +308,7 @@ static Plane3 estimate_floor_plane_ransac_cam(const cv::Mat& d, const cv::Mat& a
     return smooth;
 }
 
+/** 세 점 (x,y,z픽셀)으로 PlaneZ 계수 맞춤 */
 bool fit_plane3(const cv::Point3f& p1, const cv::Point3f& p2, const cv::Point3f& p3, PlaneZ& out)
 {
     const float x1 = p1.x, y1 = p1.y, z1 = p1.z;
@@ -310,6 +327,7 @@ bool fit_plane3(const cv::Point3f& p1, const cv::Point3f& p2, const cv::Point3f&
     return true;
 }
 
+/** intrinsics 없을 때: (x,y,z) 픽셀 좌표 RANSAC으로 z=ax+by+c 근사 */
 PlaneZ estimate_floor_plane_ransac(const cv::Mat& d, const cv::Mat& a)
 {
     const int H = d.rows;
@@ -367,6 +385,11 @@ PlaneZ estimate_floor_plane_ransac(const cv::Mat& d, const cv::Mat& a)
     return best;
 }
 
+/**
+ * 바닥 영역 이진 마스크(255=바닥).
+ * intrinsics 있으면 3D 평면 거리로, 없으면 PlaneZ 깊이 차이로 후보 픽셀을 채운 뒤
+ * 형태학·연결요소로 아래쪽 큰 덩어리만 남김.
+ */
 static void build_floor_mask_u8(int H, int W, const cv::Mat& d, const cv::Mat& a, const Params& p, cv::Mat& floor_mask)
 {
     floor_mask.create(H, W, CV_8U);
@@ -484,6 +507,11 @@ static void build_floor_mask_u8(int H, int W, const cv::Mat& d, const cv::Mat& a
     }
 }
 
+/**
+ * 3D 캐스트 그림자 가중치 맵(CV_32F 0..1): 사람 픽셀에서 평행광 방향으로 바닥 평면과 교차 →
+ * 교차점을 다시 투영해 바닥에 스플랫 누적. 에너지 낮으면 2D 워프 폴백.
+ * 마지막에 바닥 마스크·가우시안·최댓값 정규화.
+ */
 static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
                                                  const cv::Mat& a,
                                                  const cv::Mat& floor_mask,
@@ -502,11 +530,13 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
 
     const float alt = std::clamp(p.sun_altitude_deg, 6.f, 88.f) * kPi / 180.f;
     const float azi = p.sun_azimuth_deg * kPi / 180.f;
+    /* 태양 방향 단위벡터 L (카메라 좌표계, 평행광) */
     cv::Vec3f L(std::cos(azi) * std::cos(alt), std::sin(azi) * std::cos(alt), std::sin(alt));
     const float Ln = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
     if (Ln > 1e-6f)
         L *= (1.0f / Ln);
 
+    /* 태양이 너무 수평에 가까우면 광선이 평면과 거의 평행해져 수치 불안 → z 성분으로 상한 거리 완화 */
     const float lz_abs = std::max(std::abs(L[2]), 0.05f);
     const float ray_t_max_m = std::clamp(36.f / lz_abs, 10.f, 220.f);
 
@@ -522,6 +552,7 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
             if (al < 0.08f)
                 continue;
             uint16_t z = dr[x];
+            /* 사람 마스크에서 깊이 구멍이 흔함 → 이웃에서 유효 깊이 탐색 */
             if (z <= 250)
             {
                 const int rmax = 3;
@@ -550,6 +581,7 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
             if (!backproject_m(x, y, z, p, pt))
                 continue;
             const float num = -(plane3.n[0] * pt[0] + plane3.n[1] * pt[1] + plane3.n[2] * pt[2] + plane3.d);
+            /* 광선 pt + t*dir 가 바닥과 만나는 t. L 또는 -L 둘 중 유효한 쪽 */
             auto try_dir = [&](const cv::Vec3f& dir, float& out_t) -> bool {
                 const float denom = plane3.n[0] * dir[0] + plane3.n[1] * dir[1] + plane3.n[2] * dir[2];
                 if (std::abs(denom) < 1e-4f)
@@ -579,6 +611,7 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
             const float w10 = w0 * du * (1.f - dv);
             const float w01 = w0 * (1.f - du) * dv;
             const float w11 = w0 * du * dv;
+            /* 바닥 2x2 셀에 알파 가중치 분산(얇은 그림자 방지) */
             const struct { int u, v; float w; } splat[4] = {{u0, v0, w00}, {u0 + 1, v0, w10}, {u0, v0 + 1, w01}, {u0 + 1, v0 + 1, w11}};
             for (const auto& s : splat)
             {
@@ -590,6 +623,7 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
         }
     }
 
+    /* 3D 누적이 거의 없을 때: 사람 실루엣을 태양 방위로 약간 워프한 2D 그림자로 보강 */
     if (cv::sum(sh)[0] < 100.0)
     {
         cv::Mat ath;
@@ -619,6 +653,7 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
     const double bs = std::max(0.8, static_cast<double>(p.cast_shadow_blur));
     cv::GaussianBlur(sh_m, sh_m, cv::Size(0, 0), bs, bs);
 
+    /* 바닥 마스크 안 최댓값으로 0..1 정규화 → 이후 cast_shadow_alpha와 곱해 어둡게 합성 */
     double smin = 0.0, smax = 0.0;
     cv::minMaxLoc(sh_m, &smin, &smax, nullptr, nullptr, floor_mask);
     if (smax > 1e-4)
@@ -630,6 +665,7 @@ static cv::Mat build_cast_shadow_sh_m_normalized(const cv::Mat& d,
 
 } // namespace
 
+/** 외부용: 바닥 마스크 + 3D 캐스트 그림자 가중치(0..1) */
 cv::Mat compute_cast_shadow_weight(const cv::Mat& color_bgr,
                                   const cv::Mat& depth_u16,
                                   const cv::Mat& alpha_f32_hw,
@@ -649,6 +685,10 @@ cv::Mat compute_cast_shadow_weight(const cv::Mat& color_bgr,
     return build_cast_shadow_sh_m_normalized(d, a, floor_mask, p, H, W);
 }
 
+/**
+ * 깊이+바닥 평면으로 사람을 바닥에 거울상처럼 반사 블렌딩.
+ * strength는 호출부에서 floor_refl 등으로 전달.
+ */
 void apply_depth_mirror_person_reflection(cv::Mat& io_bgr,
                                           const cv::Mat& color_bgr,
                                           const cv::Mat& depth_u16,
@@ -823,6 +863,7 @@ void apply_depth_mirror_person_reflection(cv::Mat& io_bgr,
     }
 }
 
+/** RVM ONNX 로드. 가능하면 ONNX Runtime 세션, 아니면 OpenCV DNN 네트워크. */
 bool try_load_onnx(Engine& e, const std::string& path)
 {
     e.net_loaded = false;
@@ -927,6 +968,7 @@ bool try_load_onnx(Engine& e, const std::string& path)
     }
 }
 
+/** RVM 한 프레임 추론: alpha_f32_hw를 컬러와 같은 크기 CV_32F(0..1)로 채움. */
 bool infer_alpha(Engine& e, const cv::Mat& color_bgr, cv::Mat& alpha_f32_hw, float downsample_ratio)
 {
     if (!e.net_loaded || color_bgr.empty())
@@ -1080,6 +1122,7 @@ bool infer_alpha(Engine& e, const cv::Mat& color_bgr, cv::Mat& alpha_f32_hw, flo
     }
 }
 
+/** RVM 실패 시: 화면 하단 깊이 통계로 전경(사람) 알파 근사. */
 void infer_alpha_depth_fallback(const cv::Mat& color_bgr, const cv::Mat& depth_u16, cv::Mat& alpha_f32_hw)
 {
     alpha_f32_hw.create(color_bgr.size(), CV_32F);
@@ -1209,6 +1252,7 @@ void infer_alpha_depth_fallback(const cv::Mat& color_bgr, const cv::Mat& depth_u
     }
 }
 
+/** Kinect 변환: 컬러를 depth 카메라 기준으로 정렬한 BGR + 깊이(CV_16U) */
 bool color_depth_aligned_mats(const k4a::transformation& tr,
                               const k4a::image& depth,
                               const k4a::image& color,
@@ -1240,7 +1284,7 @@ bool color_depth_aligned_mats(const k4a::transformation& tr,
     }
 }
 
-/** compose_floor_with_fx 내부와 동일한 2D 수평 거울 바닥 반사. */
+/** compose_floor_with_fx와 동일한 2D 수평 거울 반사(반사면 y = reflection_plane_y). */
 static void apply_vertical_mirror_floor_reflect_work(cv::Mat& work,
                                                      const cv::Mat& color_bgr,
                                                      const cv::Mat& alpha_f32_hw,
@@ -1303,6 +1347,10 @@ void apply_compose_style_floor_reflection(cv::Mat& io_bgr,
     apply_vertical_mirror_floor_reflect_work(io_bgr, color_bgr, a, floor_mask, p);
 }
 
+/**
+ * 바닥 합성 한 번에: 접촉 그림자 → 거울 반사 → 3D 캐스트 그림자 → 알파로 원본 합성.
+ * 선택적으로 바닥 격자(녹색) 오버레이.
+ */
 cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
                                const cv::Mat& depth_u16,
                                const cv::Mat& alpha_f32_hw,
@@ -1324,9 +1372,9 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
     cv::Mat floor_mask;
     build_floor_mask_u8(H, W, d, a, p, floor_mask);
 
+    /* 사람 무게중심(cx,cy) — 바닥 접촉 그림자 감쇠 거리용 */
     double sumx = 0, sumy = 0, wa = 0;
-    for (int y = 0; 
-        y < H; ++y)
+    for (int y = 0; y < H; ++y)
     {
         const float* ap = a.ptr<float>(y);
         for (int x = 0; x < W; ++x)
@@ -1343,6 +1391,7 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
     const float cx = wa > 1e-3 ? static_cast<float>(sumx / wa) : W * 0.5f;
     const float cy = wa > 1e-3 ? static_cast<float>(sumy / wa) : H * 0.35f;
     const float sigma = static_cast<float>(std::max(W, H)) * 0.22f;
+    /* 발 위치: 화면 아래에서 알파 높은 행을 찾아 발 쪽 x,y 추정 */
     float foot_x = cx;
     float foot_y = static_cast<float>(H - 1);
     {
@@ -1384,6 +1433,7 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
             const float foot_contact = std::exp(-(fdx * fdx + fdy * fdy * 0.8f) /
                                                 (2.f * (sigma * 0.18f) * (sigma * 0.18f)));
             const float far_fade = 1.0f - 0.45f * std::clamp((static_cast<float>(H - 1 - y)) / (0.65f * H), 0.0f, 1.0f);
+            /* shadow_strength: 전역 가우시안(sh) + 발 주변(foot_contact) */
             const float dark = 1.f - p.shadow_strength * (0.75f * sh + 0.55f * foot_contact) * far_fade;
             wp[x][0] = static_cast<uint8_t>(std::clamp(wp[x][0] * dark, 0.f, 255.f));
             wp[x][1] = static_cast<uint8_t>(std::clamp(wp[x][1] * dark, 0.f, 255.f));
@@ -1391,10 +1441,10 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
         }
     }
 
-    // 바닥 반사: 수평선 y=y_mirror 대칭 → 바닥 행 y에서 보이는 색은 원본 행 ys=2*y_mirror-y.
+    // 바닥 반사: 수평선 y=y_mirror 기준으로 원본 행 ys=2*y_mirror-y 색을 블렌딩
     apply_vertical_mirror_floor_reflect_work(work, color_bgr, a, floor_mask, p);
 
-    // 3D 투영 cast shadow (person depth + floor plane + directional light)
+    // 3D 캐스트 그림자: 깊이 + 바닥 평면 + 태양 방향 L
     if (p.cast_shadow_alpha > 1e-4f && p.cam_intrin_valid)
     {
         cv::Mat sh_m = build_cast_shadow_sh_m_normalized(d, a, floor_mask, p, H, W);
@@ -1415,6 +1465,7 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
                         continue;
                     const float far_fade =
                         1.0f - 0.28f * std::clamp((static_cast<float>(H - 1 - y)) / (0.70f * H), 0.0f, 1.0f);
+                    /* sh_m: 0=밝음 1=그림자 진함 → dark로 곱해 어둡게 */
                     const float dark = 1.f - shv * ca * far_fade;
                     wp[x][0] = static_cast<uint8_t>(std::clamp(wp[x][0] * dark, 0.f, 255.f));
                     wp[x][1] = static_cast<uint8_t>(std::clamp(wp[x][1] * dark, 0.f, 255.f));
@@ -1424,6 +1475,7 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
         }
     }
 
+    /* 알파 블렌드: 사람은 원본 컬러, 배경은 work(바닥 효과 적용) */
     cv::Mat out(H, W, CV_8UC3);
     for (int y = 0; y < H; ++y)
     {
@@ -1444,7 +1496,7 @@ cv::Mat compose_floor_with_fx(const cv::Mat& color_bgr,
     {
         const int sp = std::clamp(p.floor_grid_spacing, 4, 200);
         const cv::Vec3b green(0, 255, 0);
-        const float kGridAlpha = 0.68f; // 1.0이면 그림자를 가려버리므로 반투명 유지
+        const float kGridAlpha = 0.68f; /* 1.0이면 격자가 그림자를 가림 */
         auto blend_grid = [&](cv::Vec3b& px) {
             px[0] = static_cast<uint8_t>(std::clamp(px[0] * (1.f - kGridAlpha) + green[0] * kGridAlpha, 0.f, 255.f));
             px[1] = static_cast<uint8_t>(std::clamp(px[1] * (1.f - kGridAlpha) + green[1] * kGridAlpha, 0.f, 255.f));

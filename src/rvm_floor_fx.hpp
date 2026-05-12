@@ -1,5 +1,7 @@
 #pragma once
 
+/** Azure Kinect + RVM 바닥/그림자/반사 합성 API (구현은 rvm_floor_fx.cpp). */
+
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>
 #include <array>
@@ -14,6 +16,7 @@
 
 namespace rvm_floor {
 
+/** UI/INI에서 넘기는 바닥·태양·그림자·평면 추정 파라미터 묶음 */
 struct Params
 {
     bool enabled = true;
@@ -35,7 +38,9 @@ struct Params
     float floor_anchor_u = 0.5f;
     float floor_anchor_v = 0.82f;
 
+    /** 3D 캐스트 그림자 합성 강도(0..1) */
     float cast_shadow_alpha = 0.72f;
+    /** 캐스트 그림자 맵 가우시안 시그마(픽셀 근사) */
     float cast_shadow_blur = 10.f;
     /** 3D 투영 그림자용 카메라 intrinsics (pixel) */
     bool cam_intrin_valid = false;
@@ -57,6 +62,7 @@ struct Params
     float plane_temporal_alpha = 0.22f;
 };
 
+/** RVM ONNX / ONNX Runtime 상태 보관 */
 struct Engine
 {
     cv::dnn::Net net;
